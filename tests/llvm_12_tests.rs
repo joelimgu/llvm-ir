@@ -49,9 +49,7 @@ fn constant_poison() {
     let module = Module::from_bc_path(&path).expect("Failed to parse module");
 
     let const_struct = module
-        .global_vars
-        .iter()
-        .find(|gvar| gvar.name == Name::from("const.struct"))
+        .get_global_var_by_name(&Name::from("const.struct"))
         .expect("Couldn't find @const.struct");
     let initializer = const_struct
         .initializer

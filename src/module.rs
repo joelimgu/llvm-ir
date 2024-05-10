@@ -1,11 +1,11 @@
 use crate::constant::ConstantRef;
-#[cfg(feature = "llvm-9-or-greater")]
 use crate::debugloc::*;
-use crate::function::{Function, FunctionAttribute, GroupID};
+use crate::function::{Function, FunctionAttribute, FunctionDeclaration, GroupID};
 use crate::llvm_sys::*;
 use crate::name::Name;
-use crate::types::{FPType, Type, TypeRef, Typed, Types, TypesBuilder};
+use crate::types::{FPType, NamedStructDef, Type, TypeRef, Typed, Types, TypesBuilder};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::TryFrom;
 use std::path::Path;
 
 /// See [LLVM 14 docs on Module Structure](https://releases.llvm.org/14.0.0/docs/LangRef.html#module-structure)
@@ -22,10 +22,15 @@ pub struct Module {
     /// Functions which are defined (not just declared) in this `Module`.
     /// See [LLVM 14 docs on Functions](https://releases.llvm.org/14.0.0/docs/LangRef.html#functions)
     pub functions: Vec<Function>,
+    /// Functions which are declared (but not defined) in this `Module`.
+    /// See [LLVM 14 docs on Functions](https://releases.llvm.org/14.0.0/docs/LangRef.html#functions)
+    pub func_declarations: Vec<FunctionDeclaration>,
     /// See [LLVM 14 docs on Global Variables](https://releases.llvm.org/14.0.0/docs/LangRef.html#global-variables)
     pub global_vars: Vec<GlobalVariable>,
     /// See [LLVM 14 docs on Global Aliases](https://releases.llvm.org/14.0.0/docs/LangRef.html#aliases)
     pub global_aliases: Vec<GlobalAlias>,
+    /// See [LLVM 14 docs on Global IFuncs](https://releases.llvm.org/14.0.0/docs/LangRef.html#ifuncs)
+    pub global_ifuncs: Vec<GlobalIFunc>,
     // --TODO not yet implemented-- pub function_attribute_groups: Vec<FunctionAttributeGroup>,
     /// See [LLVM 14 docs on Module-Level Inline Assembly](https://releases.llvm.org/14.0.0/docs/LangRef.html#moduleasm)
     pub inline_assembly: String,
@@ -43,14 +48,83 @@ impl Module {
         self.types.type_of(t)
     }
 
-    /// Get the `Function` having the given `Name` (if any).
-    /// Note that `Function`s are named with `String`s and not `Name`s.
+    /// Get the `Function` having the given `name` (if any).
+    /// Note that functions are named with `String`s and not `Name`s.
+    ///
+    /// Note also that this will only find _fully defined_ functions, not
+    /// `FunctionDeclaration`s.
     pub fn get_func_by_name(&self, name: &str) -> Option<&Function> {
         self.functions.iter().find(|func| func.name == name)
     }
 
+    /// Get the `FunctionDeclaration` having the given `name` (if any).
+    /// Note that functions are named with `String`s and not `Name`s.
+    ///
+    /// Note also that this will only find function _declarations_, and will not
+    /// find defined functions (use `get_func_by_name()` for that).
+    pub fn get_func_decl_by_name(&self, name: &str) -> Option<&FunctionDeclaration> {
+        self.func_declarations.iter().find(|decl| decl.name == name)
+    }
+
+    /// Get the `GlobalVariable` having the given `Name` (if any).
+    pub fn get_global_var_by_name(&self, name: &Name) -> Option<&GlobalVariable> {
+        self.global_vars.iter().find(|global| global.name == *name)
+    }
+
+    /// Get the `GlobalAlias` having the given `Name` (if any).
+    pub fn get_global_alias_by_name(&self, name: &Name) -> Option<&GlobalAlias> {
+        self.global_aliases.iter().find(|global| global.name == *name)
+    }
+
+    /// Get the `GlobalIFunc` having the given `Name` (if any).
+    pub fn get_global_ifunc_by_name(&self, name: &Name) -> Option<&GlobalIFunc> {
+        self.global_ifuncs.iter().find(|global| global.name == *name)
+    }
+
     /// Parse the LLVM bitcode (.bc) file at the given path to create a `Module`
     pub fn from_bc_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        unsafe fn parse_bc(
+            context_ref: LLVMContextRef,
+            mem_buf: LLVMMemoryBufferRef,
+            out_module: *mut LLVMModuleRef,
+        ) -> Result<(), String> {
+            let result =
+                llvm_sys::bit_reader::LLVMParseBitcodeInContext2(context_ref, mem_buf, out_module);
+            LLVMDisposeMemoryBuffer(mem_buf);
+            match result {
+                0 => Ok(()),
+                _ => Err("Failed to parse bitcode".to_owned())
+            }
+        }
+        Self::from_path(path, parse_bc)
+    }
+
+    /// Parse the LLVM text IR (.ll) file at the given path to create a `Module`
+    pub fn from_ir_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        unsafe fn parse_ir(
+            context_ref: LLVMContextRef,
+            mem_buf: LLVMMemoryBufferRef,
+            out_module: *mut LLVMModuleRef,
+        ) -> Result<(), String> {
+            use std::ffi::CStr;
+            let mut err_string = std::mem::zeroed();
+            // This call takes ownership of the buffer, so we don't free it.
+            match llvm_sys::ir_reader::LLVMParseIRInContext(context_ref, mem_buf, out_module, &mut err_string) {
+                0 => Ok(()),
+                _ => Err(format!("Failed to parse bitcode: {}",
+                                 CStr::from_ptr(err_string).to_str().expect("Failed to convert CStr")))
+            }
+        }
+        Self::from_path(path, parse_ir)
+    }
+    fn from_path(
+        path: impl AsRef<Path>,
+        parse: unsafe fn(
+            context_ref: LLVMContextRef,
+            mem_buf: LLVMMemoryBufferRef,
+            out_module: *mut LLVMModuleRef,
+        ) -> Result<(), String>,
+    ) -> Result<Self, String> {
         // implementation here inspired by the `inkwell` crate's `Module::parse_bitcode_from_path`
         use std::ffi::{CStr, CString};
         use std::mem;
@@ -83,15 +157,9 @@ impl Module {
 
         let context = crate::from_llvm::Context::new();
 
-        use llvm_sys::bit_reader::LLVMParseBitcodeInContext2;
         let module = unsafe {
             let mut module: mem::MaybeUninit<LLVMModuleRef> = mem::MaybeUninit::uninit();
-            let return_code =
-                LLVMParseBitcodeInContext2(context.ctx, memory_buffer, module.as_mut_ptr());
-            LLVMDisposeMemoryBuffer(memory_buffer);
-            if return_code != 0 {
-                return Err("Failed to parse bitcode".to_string());
-            }
+            parse(context.ctx, memory_buffer, module.as_mut_ptr())?;
             module.assume_init()
         };
         debug!("Parsed bitcode to llvm_sys module");
@@ -115,7 +183,6 @@ pub struct GlobalVariable {
     pub section: Option<String>,
     pub comdat: Option<Comdat>, // llvm-hs-pure has Option<String> for some reason
     pub alignment: u32,
-    #[cfg(feature = "llvm-9-or-greater")]
     pub debugloc: Option<DebugLoc>,
     // --TODO not yet implemented-- pub metadata: Vec<(String, MetadataRef<MetadataNode>)>,
 }
@@ -126,7 +193,6 @@ impl Typed for GlobalVariable {
     }
 }
 
-#[cfg(feature = "llvm-9-or-greater")]
 impl HasDebugLoc for GlobalVariable {
     fn get_debug_loc(&self) -> &Option<DebugLoc> {
         &self.debugloc
@@ -148,6 +214,22 @@ pub struct GlobalAlias {
 }
 
 impl Typed for GlobalAlias {
+    fn get_type(&self, _types: &Types) -> TypeRef {
+        self.ty.clone()
+    }
+}
+
+/// See [LLVM 14 docs on Global IFuncs](https://releases.llvm.org/14.0.0/docs/LangRef.html#ifuncs)
+#[derive(PartialEq, Clone, Debug)]
+pub struct GlobalIFunc {
+    pub name: Name,
+    pub linkage: Linkage,
+    pub visibility: Visibility,
+    pub ty: TypeRef,
+    pub resolver_fn: ConstantRef,
+}
+
+impl Typed for GlobalIFunc {
     fn get_type(&self, _types: &Types) -> TypeRef {
         self.ty.clone()
     }
@@ -292,9 +374,10 @@ pub struct Alignment {
     pub pref: u32,
 }
 
+
+
 /// Alignment details for function pointers.
 /// See [LLVM 14 docs on Data Layout](https://releases.llvm.org/14.0.0/docs/LangRef.html#data-layout)
-#[cfg(feature = "llvm-9-or-greater")]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FunctionPtrAlignment {
     /// If `true`, function pointer alignment is independent of function alignment.
@@ -333,10 +416,8 @@ pub struct Alignments {
     /// Alignment for aggregate types (structs, arrays)
     agg_alignment: Alignment,
     /// Alignment for function pointers
-    #[cfg(feature = "llvm-9-or-greater")]
     fptr_alignment: FunctionPtrAlignment,
     /// Alignment for function pointers, as an `Alignment`
-    #[cfg(feature = "llvm-9-or-greater")]
     fptr_alignment_as_alignment: Alignment,
     /// Layout details for (non-function-pointer) pointers, by address space
     pointer_layouts: HashMap<AddrSpace, PointerLayout>,
@@ -363,14 +444,18 @@ impl Alignments {
             Type::StructType { .. } | Type::NamedStructType { .. } | Type::ArrayType { .. } => {
                 self.agg_alignment()
             },
+            #[cfg(feature = "llvm-14-or-lower")]
             Type::PointerType {
                 pointee_type,
                 addr_space,
             } => match pointee_type.as_ref() {
-                #[cfg(feature = "llvm-9-or-greater")]
                 Type::FuncType { .. } => &self.fptr_alignment_as_alignment,
                 _ => &self.ptr_alignment(*addr_space).alignment,
             },
+            #[cfg(feature = "llvm-16-or-greater")]
+            Type::TargetExtType => todo!(),
+            #[cfg(feature = "llvm-15-or-greater")]
+            Type::PointerType { addr_space } => &self.ptr_alignment(*addr_space).alignment,
             _ => panic!("Don't know how to get the alignment of {:?}", ty),
         }
     }
@@ -436,7 +521,6 @@ impl Alignments {
     }
 
     /// Alignment of function pointers
-    #[cfg(feature = "llvm-9-or-greater")]
     pub fn fptr_alignment(&self) -> &FunctionPtrAlignment {
         &self.fptr_alignment
     }
@@ -529,9 +613,9 @@ impl Module {
         let mut global_ctr = 0; // this ctr is used to number global objects that aren't named
 
         // Modules require two passes over their contents.
-        // First we make a pass just to map global objects -- in particular, Functions,
-        //   GlobalVariables, and GlobalAliases -- to Names; then we do the actual
-        //   detailed pass.
+        // First we make a pass just to map global objects -- in particular,
+        //   Functions, GlobalVariables, GlobalAliases, and GlobalIFuncs -- to
+        //   Names; then we do the actual detailed pass.
         // This is necessary because these structures may reference each other in a
         //   circular fashion, and we need to be able to fill in the Name of the
         //   referenced object from having only its `LLVMValueRef`.
@@ -541,6 +625,7 @@ impl Module {
             .chain(get_declared_functions(module))
             .chain(get_globals(module))
             .chain(get_global_aliases(module))
+            .chain(get_global_ifuncs(module))
             .map(|g| {
                 (
                     g,
@@ -560,11 +645,17 @@ impl Module {
             functions: get_defined_functions(module)
                 .map(|f| Function::from_llvm_ref(f, &mut ctx))
                 .collect(),
+            func_declarations: get_declared_functions(module)
+                .map(|f| FunctionDeclaration::from_llvm_ref(f, &mut ctx))
+                .collect(),
             global_vars: get_globals(module)
                 .map(|g| GlobalVariable::from_llvm_ref(g, &mut global_ctr, &mut ctx))
                 .collect(),
             global_aliases: get_global_aliases(module)
                 .map(|g| GlobalAlias::from_llvm_ref(g, &mut global_ctr, &mut ctx))
+                .collect(),
+            global_ifuncs: get_global_ifuncs(module)
+                .map(|g| GlobalIFunc::from_llvm_ref(g, &mut global_ctr, &mut ctx))
                 .collect(),
             // function_attribute_groups: unimplemented!("function_attribute_groups"),  // llvm-hs collects these in the decoder monad or something
             inline_assembly: unsafe { get_module_inline_asm(module) },
@@ -620,7 +711,6 @@ impl GlobalVariable {
                 }
             },
             alignment: unsafe { LLVMGetAlignment(global) },
-            #[cfg(feature = "llvm-9-or-greater")]
             debugloc: DebugLoc::from_llvm_no_col(global),
             // metadata: unimplemented!("metadata"),
         }
@@ -648,6 +738,22 @@ impl GlobalAlias {
             dll_storage_class: DLLStorageClass::from_llvm(unsafe { LLVMGetDLLStorageClass(alias) }),
             thread_local_mode: ThreadLocalMode::from_llvm(unsafe { LLVMGetThreadLocalMode(alias) }),
             unnamed_addr: UnnamedAddr::from_llvm(unsafe { LLVMGetUnnamedAddress(alias) }),
+        }
+    }
+}
+
+impl GlobalIFunc {
+    pub(crate) fn from_llvm_ref(
+        ifunc: LLVMValueRef,
+        ctr: &mut usize,
+        ctx: &mut ModuleContext,
+    ) -> Self {
+        Self {
+            name: Name::name_or_num(unsafe { get_value_name(ifunc) }, ctr),
+            linkage: Linkage::from_llvm(unsafe { LLVMGetLinkage(ifunc) }),
+            visibility: Visibility::from_llvm(unsafe { LLVMGetVisibility(ifunc) }),
+            ty: ctx.types.type_from_llvm_ref(unsafe { LLVMTypeOf(ifunc) }),
+            resolver_fn: Constant::from_llvm_ref(unsafe { LLVMGetGlobalIFuncResolver(ifunc) }, ctx),
         }
     }
 }
@@ -772,7 +878,10 @@ impl Default for DataLayout {
 impl DataLayout {
     pub(crate) fn from_module_ref(module: LLVMModuleRef) -> Self {
         let layout_str = unsafe { get_data_layout_str(module) };
-        let mut data_layout = DataLayout { layout_str, ..Default::default() };
+        let mut data_layout = DataLayout {
+            layout_str,
+            ..Default::default()
+        };
         for spec in data_layout.layout_str.split('-') {
             if spec == "E" {
                 data_layout.endianness = Endianness::BigEndian;
@@ -924,39 +1033,25 @@ impl DataLayout {
                 assert!(chunks.next().is_none(), "datalayout 'a': Too many chunks");
                 data_layout.alignments.agg_alignment = Alignment { abi, pref };
             } else if let Some(stripped) = spec.strip_prefix("Fi") {
-                #[cfg(feature = "llvm-8-or-lower")]
-                {
-                    panic!("datalayout: Unknown spec {:?}", spec);
-                }
-                #[cfg(feature = "llvm-9-or-greater")]
-                {
-                    let abi: u32 = stripped
-                        .parse()
-                        .expect("datalayout 'Fi': Failed to parse abi");
-                    data_layout.alignments.fptr_alignment = FunctionPtrAlignment {
-                        independent: true,
-                        abi,
-                    };
-                    data_layout.alignments.fptr_alignment_as_alignment =
-                        Alignment { abi, pref: abi };
-                }
+                let abi: u32 = stripped
+                    .parse()
+                    .expect("datalayout 'Fi': Failed to parse abi");
+                data_layout.alignments.fptr_alignment = FunctionPtrAlignment {
+                    independent: true,
+                    abi,
+                };
+                data_layout.alignments.fptr_alignment_as_alignment =
+                    Alignment { abi, pref: abi };
             } else if let Some(stripped) = spec.strip_prefix("Fn") {
-                #[cfg(feature = "llvm-8-or-lower")]
-                {
-                    panic!("datalayout: Unknown spec {:?}", spec);
-                }
-                #[cfg(feature = "llvm-9-or-greater")]
-                {
-                    let abi: u32 = stripped
-                        .parse()
-                        .expect("datalayout 'Fn': Failed to parse abi");
-                    data_layout.alignments.fptr_alignment = FunctionPtrAlignment {
-                        independent: false,
-                        abi,
-                    };
-                    data_layout.alignments.fptr_alignment_as_alignment =
-                        Alignment { abi, pref: abi };
-                }
+                let abi: u32 = stripped
+                    .parse()
+                    .expect("datalayout 'Fn': Failed to parse abi");
+                data_layout.alignments.fptr_alignment = FunctionPtrAlignment {
+                    independent: false,
+                    abi,
+                };
+                data_layout.alignments.fptr_alignment_as_alignment =
+                    Alignment { abi, pref: abi };
             } else if spec.starts_with('m') {
                 let mut chunks = spec.split(':');
                 let first_chunk = chunks.next().unwrap();
@@ -1009,14 +1104,199 @@ impl DataLayout {
         }
         data_layout
     }
+
+    /// Port of `llvm::DataLayout::getTypeStoreSize`.
+    pub fn get_type_store_size(&self, types: &Types, ty: &Type) -> Option<TypeSize> {
+        let base_size = self.get_type_size_in_bits(types, ty)?;
+        fn divide_floor(numerator: u64, denominator: u32) -> u64 {
+            let aligned = &Alignment {
+                abi: denominator,
+                pref: 0,
+            }.align_to_abi(numerator);
+            aligned / (denominator as u64)
+        }
+        Some(TypeSize::new(
+            divide_floor(base_size.quantity, 8),
+            base_size.scalable,
+        ))
+    }
+
+    /// Port of `llvm::DataLayout::getTypeAllocSize`.
+    pub fn get_type_alloc_size(&self, types: &Types, ty: &Type) -> Option<TypeSize> {
+        let store_size = self.get_type_store_size(types, ty)?;
+        Some(TypeSize::fixed(self.alignments.type_alignment(ty).to_bytes().align_to_abi(
+            store_size.to_fixed()
+        )))
+    }
+
+    /// Port of `llvm::DataLayout::getTypeAllocSizeInBits`.
+    pub fn get_type_alloc_size_in_bits(&self, types: &Types, ty: &Type) -> Option<TypeSize> {
+        self.get_type_alloc_size(types, ty).map(|sz| sz * 8)
+    }
+
+    /// > Returns the number of bits necessary to hold the specified type.
+    /// >
+    /// > If Ty is a scalable vector type, the scalable property will be set and
+    /// > the runtime size will be a positive integer multiple of the base size.
+    /// >
+    /// > For example, returns 36 for i36 and 80 for x86_fp80. The type passed must
+    /// > have a size (Type::isSized() must return true).
+    ///
+    /// Port of LLVM's `DataLayout::getTypeSizeInBits`.
+    ///
+    /// Last checked against [the version in LLVM 15.0.7][upstream].
+    ///
+    /// [upstream]: https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/include/llvm/IR/DataLayout.h#L673
+    pub fn get_type_size_in_bits(&self, types: &Types, ty: &Type) -> Option<TypeSize> {
+        match ty {
+            Type::IntegerType { bits } => Some(TypeSize::fixed(u64::from(*bits))),
+            Type::PointerType {
+                addr_space,
+                ..
+            } => self
+                .alignments
+                .pointer_layouts
+                .get(addr_space)
+                .map(|ptr_layout| TypeSize::fixed(u64::from(ptr_layout.size))),
+            Type::FPType(FPType::Half) => Some(TypeSize::fixed(16)),
+            #[cfg(feature = "llvm-11-or-greater")]
+            Type::FPType(FPType::BFloat) => Some(TypeSize::fixed(16)),
+            Type::FPType(FPType::Single) => Some(TypeSize::fixed(32)),
+            Type::FPType(FPType::Double) => Some(TypeSize::fixed(64)),
+            Type::FPType(FPType::FP128) => Some(TypeSize::fixed(128)),
+            Type::FPType(FPType::X86_FP80) => Some(TypeSize::fixed(80)),
+            Type::FPType(FPType::PPC_FP128) => Some(TypeSize::fixed(128)),
+            Type::VectorType {
+                element_type,
+                num_elements,
+                scalable,
+            } => self
+                .get_type_size_in_bits(types, element_type)
+                .map(|elt_sz| {
+                    TypeSize::new(
+                        u64::try_from(*num_elements).unwrap() * elt_sz.quantity,
+                        *scalable,
+                    )
+                }),
+            Type::ArrayType {
+                element_type,
+                num_elements,
+            } => self
+                .get_type_size_in_bits(types, element_type)
+                .map(|elt_sz| {
+                    TypeSize::fixed(u64::try_from(*num_elements).unwrap() * elt_sz.quantity)
+                }),
+            Type::StructType {
+                element_types,
+                is_packed,
+            } => {
+                let mut sz = 0;
+                for elt_ty in element_types {
+                    let align = if *is_packed {
+                        Alignment { abi: 1, pref: 1 }
+                    } else {
+                        self.alignments.type_alignment(elt_ty).clone()
+                    };
+                    if !align.is_aligned_abi(sz) {
+                        sz = align.align_to_abi(sz);
+                    }
+                    if let Some(elt_sz) = self.get_type_alloc_size_in_bits(types, elt_ty) {
+                        sz += elt_sz.to_fixed();
+                    } else {
+                        return None;
+                    }
+                }
+                Some(TypeSize::fixed(sz))
+            },
+            Type::NamedStructType { name } => {
+                if let Some(NamedStructDef::Defined(def)) = types.named_struct_def(name) {
+                    self.get_type_size_in_bits(types, &def)
+                } else {
+                    None
+                }
+            },
+            Type::X86_AMXType => Some(TypeSize::fixed(8192)),
+            Type::X86_MMXType => Some(TypeSize::fixed(64)),
+            Type::FuncType { .. } => None,
+            Type::LabelType => None,
+            Type::MetadataType => None,
+            Type::TokenType => None,
+            Type::VoidType => None,
+            Type::TargetExtType => todo!(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TypeSize {
+    quantity: u64,
+    scalable: bool,
+}
+
+impl TypeSize {
+    fn new(quantity: u64, scalable: bool) -> Self {
+        Self { quantity, scalable }
+    }
+
+    fn fixed(quantity: u64) -> Self {
+        Self::new(quantity, false)
+    }
+
+    pub fn min_size_in_bits(self) -> u64 {
+        self.quantity
+    }
+
+    fn to_fixed(self) -> u64 {
+        assert!(!self.scalable);
+        self.quantity
+    }
+
+    pub fn is_fixed(self) -> bool {
+        !self.scalable
+    }
+}
+
+impl std::ops::Mul<u64> for TypeSize {
+    type Output = TypeSize;
+
+    fn mul(self, n: u64) -> Self::Output {
+        Self::new(self.quantity * n, self.scalable)
+    }
+}
+
+impl Alignment {
+    fn to_bytes(&self) -> Alignment {
+        Alignment {
+            abi: self.abi / 8,
+            pref: self.pref / 8,
+        }
+    }
+
+    // `llvm::isAligned`
+    #[inline]
+    fn is_aligned_abi(&self, n: u64) -> bool {
+        if self.abi == 0 {
+            return true;
+        }
+        n % u64::from(self.abi) == 0
+    }
+
+    // `llvm::alignTo`
+    fn align_to_abi(&self, size: u64) -> u64 {
+        if self.abi == 0 {
+            return size;
+        }
+        let value = u64::from(self.abi);
+        ((size + value - 1) / value) * value
+    }
 }
 
 impl Default for Alignments {
     fn default() -> Self {
         Self {
-            /// Explicit alignments for various sizes of integers (in bits). Sizes not
-            /// specified here are determined according to the rules described in the
-            /// Data Layout docs.
+            // Explicit alignments for various sizes of integers (in bits). Sizes not
+            // specified here are determined according to the rules described in the
+            // Data Layout docs.
             int_alignments: vec![
                 (1, Alignment { abi: 8, pref: 8 }),
                 (8, Alignment { abi: 8, pref: 8 }),
@@ -1026,9 +1306,9 @@ impl Default for Alignments {
             ]
             .into_iter()
             .collect(),
-            /// Explicit alignments for various sizes of vectors (in bits). Sizes not
-            /// specified here are determined according to the rules described in the
-            /// Data Layout docs.
+            // Explicit alignments for various sizes of vectors (in bits). Sizes not
+            // specified here are determined according to the rules described in the
+            // Data Layout docs.
             vec_alignments: vec![
                 (64, Alignment { abi: 64, pref: 64 }),
                 (
@@ -1041,7 +1321,7 @@ impl Default for Alignments {
             ]
             .into_iter()
             .collect(),
-            /// Alignment for floating-point types, by size (in bits)
+            // Alignment for floating-point types, by size (in bits)
             fp_alignments: vec![
                 (16, Alignment { abi: 16, pref: 16 }),
                 (32, Alignment { abi: 32, pref: 32 }),
@@ -1056,18 +1336,16 @@ impl Default for Alignments {
             ]
             .into_iter()
             .collect(),
-            /// Alignment for aggregate types (structs, arrays)
+            // Alignment for aggregate types (structs, arrays)
             agg_alignment: Alignment { abi: 0, pref: 64 },
-            /// Alignment for function pointers
-            #[cfg(feature = "llvm-9-or-greater")]
+            // Alignment for function pointers
             fptr_alignment: FunctionPtrAlignment {
                 independent: true,
                 abi: 64,
             },
-            /// Alignment for function pointers, as an `Alignment`
-            #[cfg(feature = "llvm-9-or-greater")]
+            // Alignment for function pointers, as an `Alignment`
             fptr_alignment_as_alignment: Alignment { abi: 64, pref: 64 },
-            /// Layout details for (non-function-pointer) pointers, by address space
+            // Layout details for (non-function-pointer) pointers, by address space
             pointer_layouts: vec![(
                 0,
                 PointerLayout {
@@ -1079,5 +1357,129 @@ impl Default for Alignments {
             .into_iter()
             .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::types::{FPType, Type, TypesBuilder};
+
+    use super::{DataLayout, TypeSize};
+
+    // https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/include/llvm/IR/DataLayout.h#L441-L456
+
+    #[test]
+    fn test_size_in_bits() {
+        let dl = DataLayout::default();
+        let types = TypesBuilder::new().build();
+        assert_eq!(
+            Some(TypeSize::fixed(1)),
+            dl.get_type_size_in_bits(&types, &types.bool())
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(8)),
+            dl.get_type_size_in_bits(&types, &types.i8())
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(19)),
+            dl.get_type_size_in_bits(&types, &types.int(19))
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(32)),
+            dl.get_type_size_in_bits(&types, &types.single())
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(64)),
+            dl.get_type_size_in_bits(&types, &types.double())
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(80)),
+            dl.get_type_size_in_bits(&types, &types.fp(FPType::X86_FP80))
+        );
+    }
+
+    #[test]
+    fn test_alloc_size() {
+        let dl = DataLayout::default();
+        let types = TypesBuilder::new().build();
+        assert_eq!(
+            Some(TypeSize::fixed(8)),
+            dl.get_type_alloc_size_in_bits(&types, &types.bool())
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(8)),
+            dl.get_type_alloc_size_in_bits(&types, &types.i8())
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(32)),
+            dl.get_type_alloc_size_in_bits(&types, &types.int(19))
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(32)),
+            dl.get_type_alloc_size_in_bits(&types, &types.single())
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(64)),
+            dl.get_type_alloc_size_in_bits(&types, &types.double())
+        );
+        // FP80 has no alignment information in default data layout...
+    }
+
+    #[test]
+    fn test_struct_size() {
+        let dl = DataLayout::default();
+        let types = TypesBuilder::new().build();
+        assert_eq!(
+            Some(TypeSize::fixed(0)),
+            dl.get_type_alloc_size_in_bits(
+                &types,
+                &Type::StructType {
+                    element_types: vec![],
+                    is_packed: false
+                }
+            )
+        );
+        // The i8 needs to be padded for the i32
+        assert_eq!(
+            Some(TypeSize::fixed(64)),
+            dl.get_type_alloc_size_in_bits(
+                &types,
+                &Type::StructType {
+                    element_types: vec![types.i8(), types.i32()],
+                    is_packed: false
+                }
+            )
+        );
+        // The i8 needs to be padded for the pointer
+        assert_eq!(
+            Some(TypeSize::fixed(128)),
+            dl.get_type_alloc_size_in_bits(
+                &types,
+                &Type::StructType {
+                    element_types: vec![types.i8(), types.pointer_to(types.i8())],
+                    is_packed: false
+                }
+            )
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(72)),
+            dl.get_type_alloc_size_in_bits(
+                &types,
+                &Type::StructType {
+                    element_types: vec![types.i8(), types.pointer_to(types.i8())],
+                    is_packed: true
+                }
+            )
+        );
+        assert_eq!(
+            Some(TypeSize::fixed(128)),
+            dl.get_type_alloc_size_in_bits(
+                &types,
+                &Type::StructType {
+                    element_types: vec![types.pointer_to(types.i8()), types.pointer_to(types.i8())],
+                    is_packed: false
+                }
+            )
+        );
     }
 }
